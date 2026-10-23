@@ -3,9 +3,14 @@ package localfile
 import (
 	"bytes"
 	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -550,4 +555,234 @@ func mustRecord(t *testing.T, kind recordType, value any) []byte {
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+// TestDecodeLogMatchesDecodingByType compares decodeLog with the decode it
+// replaced, which decoded each line's envelope and then its data by the
+// record's type: the same state, committed size, and error for each log.
+func TestDecodeLogMatchesDecodingByType(t *testing.T) {
+	for name, encoded := range decodeCases(t) {
+		t.Run(name, func(t *testing.T) { assertDecodesByType(t, encoded) })
+	}
+}
+
+func FuzzDecodeLog(f *testing.F) {
+	for _, encoded := range decodeCases(f) {
+		f.Add(encoded)
+	}
+	f.Fuzz(assertDecodesByType)
+}
+
+// TestDecodeLogDecodesEachLineOnce checks that decoding a session, most of
+// it commands' output, allocates less than the decode by type, which copied
+// each record's data to decode it a second time.
+func TestDecodeLogDecodesEachLineOnce(t *testing.T) {
+	encoded := longSession(t, "session-1", 4)
+	allocated := func(decode func([]byte) (storedState, int64, error)) uint64 {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if _, _, err := decode(encoded); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	if got, byType := allocated(decodeLog), allocated(decodeLogByType); got > byType*3/4 {
+		t.Fatalf("decoding %d bytes allocated %d, decoding by type %d", len(encoded), got, byType)
+	}
+}
+
+func assertDecodesByType(t *testing.T, encoded []byte) {
+	state, size, err := decodeLog(encoded)
+	wantState, wantSize, wantErr := decodeLogByType(encoded)
+	if fmt.Sprint(err) != fmt.Sprint(wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if size != wantSize || !reflect.DeepEqual(state, wantState) {
+		t.Fatalf("decoded %d bytes to %#v\nwant %d bytes, %#v", size, state, wantSize, wantState)
+	}
+}
+
+// decodeCases are logs to decode: valid ones, a fork's, and lines that only
+// the decode by type accepts or that neither accepts.
+func decodeCases(tb testing.TB) map[string][]byte {
+	tb.Helper()
+	line := func(kind recordType, value any) []byte {
+		encoded, err := encodeRecord(kind, value)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return encoded
+	}
+	long := longSession(tb, "session-1", 1)
+	child, err := forkStoredState(testState(tb, "parent", 3), "session-1", "turn-1", stateUpdatedAt)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	fork, err := encodeInitialLog(child.Snapshot.Session, child.Items)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	fork = append(fork, line(recordItem, itemRecord{Item: sessionstore.Item{
+		Sequence: sessionstore.Sequence(len(child.Items) + 1), RecordedAt: stateUpdatedAt,
+		Kind: sessionstore.ItemTurn, Data: session.Turn{ID: "turn-own", PreviousTurnID: "turn-1", Type: session.TurnRegular},
+	}})...)
+	header := line(recordSession, sessionRecord{Version: formatVersion, Session: session.Session{ID: "session-1", CreatedAt: stateCreatedAt}})
+	turn := line(recordItem, itemRecord{Item: sessionstore.Item{
+		Sequence: 1, RecordedAt: stateUpdatedAt, Kind: sessionstore.ItemTurn, Data: session.Turn{ID: "turn-1", Type: session.TurnRegular},
+	}})
+	ready := line(recordOperation, operationRecord{Operation: validOperation("operation-1", operation.StatusReady)})
+	join := func(lines ...[]byte) []byte { return bytes.Join(lines, nil) }
+	// with puts member, a field of another record type's data, in the line's data.
+	with := func(line []byte, member string) []byte {
+		return bytes.Replace(line, []byte(`"data":{`), []byte(`"data":{`+member+`,`), 1)
+	}
+	cases := map[string][]byte{
+		"long session":           long,
+		"incomplete tail":        append(append([]byte(nil), long[:len(long)-1]...), `{"type":"item"`...),
+		"fork":                   fork,
+		"fields of other types":  join(with(header, `"Operation":5`), with(turn, `"Version":"two"`)),
+		"operation with an item": join(header, turn, with(ready, `"Item":[]`)),
+		"not a record":           join(header, []byte("{\n")),
+		"duplicate type":         join(header, []byte(`{"type":"item","type":"item","data":{}}`+"\n")),
+		"unknown type":           join(header, []byte(`{"type":"unknown","data":5}`+"\n")),
+		"malformed session data": []byte(`{"type":"session","data":[]}` + "\n"),
+		"null item data":         join(header, []byte(`{"type":"item","data":{"Item":{"Kind":"turn","Data":null}}}`+"\n")),
+		"session not first":      join(header, header),
+		"operation first":        ready,
+		"unknown operation":      join(header, ready),
+		"session without data":   []byte(`{"type":"session"}` + "\n"),
+		"item with null data":    join(header, []byte(`{"type":"item","data":null}`+"\n")),
+	}
+	for _, name := range []string{"golden-session", "golden-fork", "legacy-session", "soft-stop-session"} {
+		encoded, err := os.ReadFile(filepath.Join("testdata", name+sessionFileSuffix))
+		if err != nil {
+			tb.Fatal(err)
+		}
+		cases[name] = encoded
+	}
+	return cases
+}
+
+// decodeLogByType is decodeLog as it was before it decoded each line in one
+// pass, for the comparison.
+func decodeLogByType(encoded []byte) (storedState, int64, error) {
+	lastNewline := bytes.LastIndexByte(encoded, '\n')
+	if lastNewline < 0 {
+		return storedState{}, 0, fmt.Errorf("session log has no committed records")
+	}
+	committedSize := int64(lastNewline + 1)
+	lines := bytes.Split(encoded[:committedSize], []byte{'\n'})
+	lines = lines[:len(lines)-1]
+
+	var value storedState
+	records := make([]decodedRecord, 0, len(lines))
+	itemCount := 0
+	inheritedItemCount := 0
+	for lineIndex, line := range lines {
+		var record logRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			return storedState{}, 0, fmt.Errorf("decode record %d: %w", lineIndex+1, err)
+		}
+		switch record.Type {
+		case recordSession:
+			if lineIndex != 0 {
+				return storedState{}, 0, fmt.Errorf("session record must be first")
+			}
+			var header sessionRecord
+			if err := json.Unmarshal(record.Data, &header); err != nil {
+				return storedState{}, 0, fmt.Errorf("decode session record: %w", err)
+			}
+			if header.Version == 1 {
+				return storedState{}, 0, fmt.Errorf(
+					"legacy session format version 1 cannot be resumed",
+				)
+			}
+			if header.Version != formatVersion {
+				return storedState{}, 0, fmt.Errorf("unsupported session format version %d", header.Version)
+			}
+			if err := validateSessionID(header.Session.ID); err != nil {
+				return storedState{}, 0, err
+			}
+			if header.Session.CreatedAt.IsZero() {
+				return storedState{}, 0, fmt.Errorf("session %q creation time is zero", header.Session.ID)
+			}
+			value = newStoredState(header.Session.ID, header.Session.CreatedAt)
+		case recordItem:
+			if lineIndex == 0 {
+				return storedState{}, 0, fmt.Errorf("session record must be first")
+			}
+			var itemValue itemRecord
+			if err := json.Unmarshal(record.Data, &itemValue); err != nil {
+				return storedState{}, 0, fmt.Errorf("decode item record: %w", err)
+			}
+			wantSequence := sessionstore.Sequence(itemCount + 1)
+			if itemValue.Item.Sequence != wantSequence {
+				return storedState{}, 0, fmt.Errorf(
+					"item %d has sequence %d, want %d",
+					itemCount,
+					itemValue.Item.Sequence,
+					wantSequence,
+				)
+			}
+			if itemValue.Item.RecordedAt.IsZero() {
+				return storedState{}, 0, fmt.Errorf("item %d recorded time is zero", itemCount)
+			}
+			if itemValue.Item.Kind != sessionstore.ItemToolCallStatus && len(itemValue.Operations) != 0 {
+				return storedState{}, 0, fmt.Errorf(
+					"item %d of kind %q initializes operations",
+					itemCount,
+					itemValue.Item.Kind,
+				)
+			}
+			itemCount++
+			if itemValue.Item.Kind == sessionstore.ItemFork {
+				inheritedItemCount = itemCount
+			}
+			records = append(records, decodedRecord{Type: recordItem, Item: itemValue})
+		case recordOperation:
+			if lineIndex == 0 {
+				return storedState{}, 0, fmt.Errorf("session record must be first")
+			}
+			var update operationRecord
+			if err := json.Unmarshal(record.Data, &update); err != nil {
+				return storedState{}, 0, fmt.Errorf("decode operation record: %w", err)
+			}
+			records = append(records, decodedRecord{
+				Type: recordOperation, Operation: update.Operation,
+			})
+		default:
+			return storedState{}, 0, fmt.Errorf("unsupported record type %q", record.Type)
+		}
+	}
+
+	replayedItems := 0
+	for recordIndex, record := range records {
+		switch record.Type {
+		case recordItem:
+			itemIndex := replayedItems
+			replayedItems++
+			if itemIndex < inheritedItemCount {
+				if len(record.Item.Operations) != 0 {
+					return storedState{}, 0, fmt.Errorf("inherited item %d initializes operations", itemIndex)
+				}
+				value.inheritItem(record.Item.Item)
+				continue
+			}
+			if err := replayItem(&value, record.Item); err != nil {
+				return storedState{}, 0, fmt.Errorf("apply item %d: %w", itemIndex, err)
+			}
+		case recordOperation:
+			if replayedItems < inheritedItemCount {
+				return storedState{}, 0, fmt.Errorf(
+					"operation record %d appears in inherited history",
+					recordIndex+2,
+				)
+			}
+			if err := value.saveOperation(record.Operation); err != nil {
+				return storedState{}, 0, fmt.Errorf("apply operation record: %w", err)
+			}
+		}
+	}
+	return value, committedSize, nil
 }

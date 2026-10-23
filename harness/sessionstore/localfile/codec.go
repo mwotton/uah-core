@@ -41,10 +41,38 @@ type operationRecord struct {
 	Operation operation.Operation
 }
 
+// recordLine is a record line decoded in one pass: Data has the fields of
+// every record type, and Type says which of them the record holds. A
+// logRecord copies its data to decode it a second time, which on a large
+// session took more than a third of the decode. Data is nil for a line
+// without data, whose record decodes its missing data as before.
+type recordLine struct {
+	Type recordType    `json:"type"`
+	Data *recordFields `json:"data"`
+}
+
+type recordFields struct {
+	sessionRecord
+	itemRecord
+	operationRecord
+}
+
 type decodedRecord struct {
 	Type      recordType
 	Item      itemRecord
 	Operation operation.Operation
+}
+
+// recordData is a record's data: from its line's one-pass decode when that
+// succeeded, else decoded by the record type's own fields. Only the one-pass
+// decode fails on a field of another record type with a value wrong for it.
+func recordData[T any](decoded bool, value T, data jsontext.Value) (T, error) {
+	if decoded {
+		return value, nil
+	}
+	var own T
+	err := json.Unmarshal(data, &own)
+	return own, err
 }
 
 func encodeInitialLog(value session.Session, items []sessionstore.Item) ([]byte, error) {
@@ -98,17 +126,24 @@ func decodeLog(encoded []byte) (storedState, int64, error) {
 	itemCount := 0
 	inheritedItemCount := 0
 	for lineIndex, line := range lines {
+		var one recordLine
+		decoded := json.Unmarshal(line, &one) == nil && one.Data != nil
 		var record logRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			return storedState{}, 0, fmt.Errorf("decode record %d: %w", lineIndex+1, err)
+		if decoded {
+			record.Type = one.Type
+		} else {
+			one.Data = new(recordFields)
+			if err := json.Unmarshal(line, &record); err != nil {
+				return storedState{}, 0, fmt.Errorf("decode record %d: %w", lineIndex+1, err)
+			}
 		}
 		switch record.Type {
 		case recordSession:
 			if lineIndex != 0 {
 				return storedState{}, 0, fmt.Errorf("session record must be first")
 			}
-			var header sessionRecord
-			if err := json.Unmarshal(record.Data, &header); err != nil {
+			header, err := recordData(decoded, one.Data.sessionRecord, record.Data)
+			if err != nil {
 				return storedState{}, 0, fmt.Errorf("decode session record: %w", err)
 			}
 			if header.Version == 1 {
@@ -130,8 +165,8 @@ func decodeLog(encoded []byte) (storedState, int64, error) {
 			if lineIndex == 0 {
 				return storedState{}, 0, fmt.Errorf("session record must be first")
 			}
-			var itemValue itemRecord
-			if err := json.Unmarshal(record.Data, &itemValue); err != nil {
+			itemValue, err := recordData(decoded, one.Data.itemRecord, record.Data)
+			if err != nil {
 				return storedState{}, 0, fmt.Errorf("decode item record: %w", err)
 			}
 			wantSequence := sessionstore.Sequence(itemCount + 1)
@@ -162,8 +197,8 @@ func decodeLog(encoded []byte) (storedState, int64, error) {
 			if lineIndex == 0 {
 				return storedState{}, 0, fmt.Errorf("session record must be first")
 			}
-			var update operationRecord
-			if err := json.Unmarshal(record.Data, &update); err != nil {
+			update, err := recordData(decoded, one.Data.operationRecord, record.Data)
+			if err != nil {
 				return storedState{}, 0, fmt.Errorf("decode operation record: %w", err)
 			}
 			records = append(records, decodedRecord{
