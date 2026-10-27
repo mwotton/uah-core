@@ -15,6 +15,16 @@ asynchronous and durable:
   providers (OpenAI, the ChatGPT Codex backend, OpenRouter, Fireworks, Ollama).
   It encodes request history once and reuses it across requests, and it
   supports custom tools with free-form input.
+- **Responses WebSocket.** `responsesapi.WebSocketTransport` is an
+  `http.RoundTripper` for the client that sends each request over one
+  WebSocket, as Codex does with the ChatGPT backend, and answers with the
+  server's events as an SSE stream. A request that extends the last one,
+  with the same fields and the last input and output first, sends only its
+  new input with `previous_response_id`. Any other request, the first on a
+  new connection, and one after a response that did not complete send the
+  whole input. A request while another is in flight goes over HTTP, and so
+  does every request after a 426 to the upgrade or three WebSocket failures
+  in a row.
 - **Developer messages.** An `inbox.InputDeveloper` input is the harness's
   own message, such as context it prepares for a session. It is recorded,
   resumed, and forked like a user message and goes to the model as a
