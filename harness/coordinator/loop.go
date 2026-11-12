@@ -144,7 +144,7 @@ func (current *coordinator) Run(ctx context.Context) error {
 			continue
 		}
 
-		if !current.isWaitingForOnlyToolCalls() {
+		if !current.isWaitingForOnlyToolCalls() || len(current.heartbeatCalls()) == 0 {
 			heartbeat = nil
 		} else if heartbeat == nil && current.dependencies.ToolHeartbeatInterval > 0 {
 			heartbeat = time.After(current.dependencies.ToolHeartbeatInterval)
@@ -265,14 +265,14 @@ func (current *coordinator) processModelResponse(ctx context.Context, modelRespo
 // reports false when no call runs, which leaves the default.
 func (current *coordinator) holdTurn(statuses []sessionstore.ToolCallStatus) bool {
 	policy := current.dependencies.Wake
-	deadline := time.Now().Add(policy.Hold)
+	now := time.Now()
 	for _, status := range statuses {
 		key := toolCallKey{turnID: status.TurnID, callID: status.CallID}
 		if _, running := current.state.toolCalls[key]; !running {
 			continue
 		}
 		current.state.graceToolCalls[key] = struct{}{}
-		current.state.valves[key] = deadline
+		current.state.valves[key] = now.Add(policy.callHold(current.state.toolCalls[key].toolCall))
 	}
 	current.armValve()
 	if len(current.state.graceToolCalls) == 0 {
@@ -286,6 +286,7 @@ func (current *coordinator) holdTurn(statuses []sessionstore.ToolCallStatus) boo
 // deadline, with its output so far, and stops holding the turn for it.
 func (current *coordinator) openValves() {
 	now := time.Now()
+	opened := false
 	keys := slices.SortedFunc(maps.Keys(current.state.valves), func(a, b toolCallKey) int {
 		return cmp.Compare(a.callID, b.callID)
 	})
@@ -297,12 +298,15 @@ func (current *coordinator) openValves() {
 		if _, running := current.state.toolCalls[key]; !running {
 			continue
 		}
-		current.addToolProgress(key, current.dependencies.Wake.Hold)
+		current.addToolProgress(key, current.dependencies.Wake.callHold(current.state.toolCalls[key].toolCall))
 		current.state.availableInputs++
 		delete(current.state.graceToolCalls, key)
-		if len(current.state.graceToolCalls) == 0 {
-			current.clearToolGrace()
-		}
+		opened = true
+	}
+	if opened {
+		// A call reaching its deadline wakes the model even when a
+		// deliberate wait from the same turn has a later deadline.
+		current.clearToolGrace()
 	}
 	current.armValve()
 }
@@ -399,9 +403,9 @@ func (current *coordinator) isWaitingForOnlyToolCalls() bool {
 }
 
 func (current *coordinator) postHeartbeat(ctx context.Context) error {
-	calls := make([]llm.ToolCall, 0, len(current.state.toolCalls))
-	for _, call := range current.state.toolCalls {
-		calls = append(calls, call.toolCall)
+	calls := current.heartbeatCalls()
+	if len(calls) == 0 {
+		return nil
 	}
 	slices.SortFunc(calls, func(a, b llm.ToolCall) int {
 		return cmp.Compare(a.CallID, b.CallID)
@@ -420,6 +424,21 @@ func (current *coordinator) postHeartbeat(ctx context.Context) error {
 	return current.dependencies.Inbox.Submit(ctx, inbox.Input{
 		ID: inbox.ID(uuid.New().String()), Kind: inbox.InputControl, Payload: payload,
 	})
+}
+
+// heartbeatCalls leaves deliberately blocking calls quiet while their
+// hold is active. Other calls retain their normal heartbeat.
+func (current *coordinator) heartbeatCalls() []llm.ToolCall {
+	calls := make([]llm.ToolCall, 0, len(current.state.toolCalls))
+	now := time.Now()
+	for key, call := range current.state.toolCalls {
+		if quiet := current.dependencies.Wake.QuietHold; quiet != nil &&
+			current.state.valves[key].After(now) && quiet(call.toolCall) > 0 {
+			continue
+		}
+		calls = append(calls, call.toolCall)
+	}
+	return calls
 }
 
 func (current *coordinator) interruptModel() {

@@ -51,6 +51,12 @@ type WakePolicy struct {
 	// after Hold, from any turn, wakes the model with its output so far and
 	// stops holding the turn back.
 	Hold time.Duration
+	// QuietHold optionally overrides Hold for an explicitly blocking call.
+	// A positive duration also suppresses automatic tool heartbeats for
+	// that call until its deadline; user input and other calls still wake
+	// the model normally. Zero or negative uses Hold. The callback must be
+	// pure: it may be called more than once for the same call.
+	QuietHold func(llm.ToolCall) time.Duration
 	// Progress renders the output so far of a call that outlived Hold; nil
 	// or an empty result shows no output.
 	Progress func([]operation.Operation) string
